@@ -19,6 +19,17 @@ class TelegramChat(BaseModel):
     first_name: Optional[str] = None
 
 
+class TelegramDocument(BaseModel):
+    """Telegram document (file) payload — used for PDF brand-passport uploads."""
+    file_id: str
+    file_unique_id: Optional[str] = None
+    file_name: Optional[str] = None
+    mime_type: Optional[str] = None
+    file_size: Optional[int] = None
+
+    model_config = {"extra": "ignore"}
+
+
 class TelegramMessage(BaseModel):
     message_id: int
     # `from` is a Python keyword — use alias and populate_by_name so Pydantic
@@ -27,13 +38,22 @@ class TelegramMessage(BaseModel):
     chat: TelegramChat
     date: int
     text: Optional[str] = None
+    # Document uploads (PDFs) must be modelled explicitly, otherwise Pydantic
+    # silently strips the field and the onboarding handler never sees the file.
+    document: Optional[TelegramDocument] = None
+    caption: Optional[str] = None
 
-    model_config = {"populate_by_name": True}
+    # Keep any other Telegram fields around so future payloads aren't lost.
+    model_config = {"populate_by_name": True, "extra": "allow"}
 
 
 class TelegramUpdate(BaseModel):
     update_id: int
     message: Optional[TelegramMessage] = None
+    business_connection: Optional[dict] = None
+    business_message: Optional[TelegramMessage] = None
+    pre_checkout_query: Optional[dict] = None
+    callback_query: Optional[dict] = None
 
 
 # ── Internal domain models ───────────────────────────────────────────────────

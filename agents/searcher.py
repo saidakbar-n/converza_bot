@@ -7,19 +7,18 @@ Pulls:
 - The prospect record
 """
 
-from db.supabase_client import sb
+from services.brand_passport import get_org_context
+
+
+async def get_organization(org_id: str) -> dict:
+    """Return org context with normalized brand passport for agent consumption."""
+    return get_org_context(org_id)
 
 
 async def get_brand_context(org_id: str) -> dict:
-    """Return the brand passport for the given org, or an empty dict."""
-    result = (
-        sb.table("brand_passports")
-        .select("*")
-        .eq("organization_id", org_id)   # brand_passports still uses organization_id
-        .maybe_single()
-        .execute()
-    )
-    return result.data or {}
+    """Return the brand passport for the given org."""
+    org = await get_organization(org_id)
+    return org.get("brand_context", {})
 
 
 async def get_conversation_history(
@@ -31,6 +30,8 @@ async def get_conversation_history(
     Return the last `limit` messages for this prospect, oldest first,
     formatted as {role, content} pairs for LLM context.
     """
+    from db.supabase_client import sb
+
     result = (
         sb.table("messages")
         .select("direction, content, sent_by, created_at")
@@ -53,6 +54,8 @@ async def get_conversation_history(
 
 async def get_prospect(prospect_id: str) -> dict:
     """Return full prospect record."""
+    from db.supabase_client import sb
+
     result = (
         sb.table("prospects")
         .select("*")
@@ -60,4 +63,4 @@ async def get_prospect(prospect_id: str) -> dict:
         .maybe_single()
         .execute()
     )
-    return result.data or {}
+    return (result.data if result else None) or {}

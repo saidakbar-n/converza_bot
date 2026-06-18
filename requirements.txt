@@ -4,3 +4,9 @@ supabase
 httpx
 python-dotenv
 pydantic
+PyMuPDF
+python-multipart
+apscheduler
+redis
+pytest
+

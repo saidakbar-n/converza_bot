@@ -21,8 +21,8 @@ import httpx
 from db.supabase_client import sb
 from models.schemas import HITLDecision, DraftCreate
 
-TELEGRAM_HITL_BOT_TOKEN = os.environ["TELEGRAM_HITL_BOT_TOKEN"]
-TELEGRAM_HITL_CHAT_ID = os.environ["TELEGRAM_HITL_CHAT_ID"]
+TELEGRAM_HITL_BOT_TOKEN = os.environ.get("TELEGRAM_HITL_BOT_TOKEN", "")
+TELEGRAM_HITL_CHAT_ID = os.environ.get("TELEGRAM_HITL_CHAT_ID", "")
 HITL_API = f"https://api.telegram.org/bot{TELEGRAM_HITL_BOT_TOKEN}"
 
 APPROVAL_TIMEOUT_SECONDS = 120
@@ -61,7 +61,7 @@ async def get_draft(draft_id: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return result.data if result else None
 
 
 async def update_draft(
