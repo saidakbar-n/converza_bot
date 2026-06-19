@@ -19,8 +19,13 @@ from db.supabase_client import sb
 from agents.searcher import get_organization, get_conversation_history
 from agents.hitl import request_approval
 from models.schemas import MessageCreate
-from services.config import is_production
 from services.org_resolver import lookup_business_connection_id
+from services.payments import (
+    get_payment_provider_token,
+    is_configured_provider_token,
+    payment_unavailable_prospect_message,
+    payments_enabled,
+)
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -31,21 +36,6 @@ HITL_ENABLED = os.getenv("HITL_ENABLED", "false").lower() == "true"
 DEFAULT_USD_TO_UZS = int(os.getenv("USD_TO_UZS", "12500"))
 # Telegram UZS invoices use whole so'm (no subunits). Default ≈ 375 000 so'm.
 DEFAULT_INVOICE_AMOUNT_UZS = int(os.getenv("DEFAULT_INVOICE_AMOUNT_UZS", "375000"))
-INVALID_PROVIDER_TOKENS = {"", "123456", "test", "changeme", "your_token_here"}
-
-
-def get_payment_provider_token(org: dict) -> str:
-    org_token = (org.get("click_token") or "").strip()
-    if is_production() and is_configured_provider_token(org_token):
-        return org_token
-    return (
-        os.getenv("CLICK_TEST_PROVIDER_TOKEN")
-        or os.getenv("CLICK_PROVIDER_TOKEN")
-        or os.getenv("TELEGRAM_PAYMENT_PROVIDER_TOKEN")
-        or org_token
-    )
-
-
 def _telegram_send_payload(
     chat_id: int,
     text: str,
@@ -64,21 +54,6 @@ async def _resolve_business_connection_id(
     if business_connection_id:
         return business_connection_id
     return lookup_business_connection_id(org_id)
-
-
-def is_configured_provider_token(provider_token: str | None) -> bool:
-    token = (provider_token or "").strip()
-    if token.lower() in INVALID_PROVIDER_TOKENS:
-        return False
-    return len(token) >= 20 and ":" in token
-
-
-def payment_setup_message() -> str:
-    return (
-        "Click test provider token noto'g'ri sozlangan. "
-        "@BotFather ichida shu sales bot uchun Payments/Click ni ulang va olingan "
-        "Telegram provider tokenni CLICK_TEST_PROVIDER_TOKEN ga yozing."
-    )
 
 
 def _price_to_uzs(price: object) -> int | None:
@@ -156,7 +131,7 @@ async def send_invoice(
 ) -> httpx.Response:
     item = invoice_item or {
         "title": "Converza DM Closer",
-        "description": "Test to'lov. Hozircha Click test provider orqali ishlaydi.",
+        "description": "Telegram orqali to'lov",
         "label": "DM Closer",
         "amount": DEFAULT_INVOICE_AMOUNT_UZS,
     }
@@ -177,7 +152,7 @@ async def send_invoice(
         return await client.post(f"{TELEGRAM_API}/sendInvoice", json=body)
 
 
-def _build_system_prompt(brand: dict) -> str:
+def _build_system_prompt(brand: dict, *, payments_enabled: bool) -> str:
     faq_text = ""
     for item in brand.get("faq", []):
         faq_text += f"Q: {item.get('question', '')}\nA: {item.get('answer', '')}\n"
@@ -195,6 +170,17 @@ def _build_system_prompt(brand: dict) -> str:
 
     raw_notes = brand.get("raw_notes") or ""
     tone = brand.get("tone") or brand.get("brand_voice") or "samimiy va ishonchli"
+
+    if payments_enabled:
+        payment_rule = (
+            "- Agar mijoz sotib olishga rozi bo'lsa yoki to'lov qilmoqchi bo'lsa, "
+            "invoice_required=true qiling va mos pricing tier nomini invoice_tier ga yozing."
+        )
+    else:
+        payment_rule = (
+            "- Click to'lovi hozir yoqilmagan. invoice_required hech qachon true bo'lmasin; "
+            "to'lov bo'yicha mijozga qisqa yo'riqnoma yoki bog'lanish taklif qiling."
+        )
 
     return f"""Siz {brand.get('brand_name', 'ushbu kompaniya')} uchun juda samimiy va ishonchli sotuv menejerisiz. Barcha javoblaringiz faqat O'zbek tilida bo'lishi shart.
 
@@ -229,7 +215,7 @@ QOIDALAR:
 - O'zbek tilida, tabiiy va samimiy gapiring. Hech qachon robotdek gapirmang.
 - Bir vaqtning o'zida faqat Bitta savol bering. Tergov qilmang.
 - Mijozning e'tirozlarini to'g'ri qabul qilib, unga qiymatni tushuntiring.
-- Agar mijoz sotib olishga rozi bo'lsa yoki to'lov qilmoqchi bo'lsa, invoice_required=true qiling va mos pricing tier nomini invoice_tier ga yozing.
+{payment_rule}
 - Iloji boricha qisqa (1-3 gap) va lo'nda yozing.
 - Mijoz birinchi bo'lib emoji ishlatmaguncha emoji ishlatmang.
 - FAQAT JSON formatida javob qaytaring, boshqa hech qanday so'z yozmang."""
@@ -251,7 +237,8 @@ async def generate_reply(
     conn_id = await _resolve_business_connection_id(org_id, business_connection_id)
 
     # ── 2. Build messages ───────────────────────────────────────────────────
-    system_prompt = _build_system_prompt(brand)
+    can_accept_payments = payments_enabled(org)
+    system_prompt = _build_system_prompt(brand, payments_enabled=can_accept_payments)
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": inbound_text})
@@ -326,7 +313,8 @@ async def generate_reply(
         tg_resp.raise_for_status()
     else:
         if is_invoice and not is_configured_provider_token(click_token):
-            final_text = final_text or payment_setup_message()
+            if not final_text:
+                final_text = payment_unavailable_prospect_message()
 
         async with httpx.AsyncClient(timeout=10) as client:
             tg_resp = await client.post(

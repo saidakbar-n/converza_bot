@@ -217,8 +217,9 @@ def upsert_passport(org_id: str, data: dict) -> dict:
 def sync_organization(org_id: str, click_token: str | None = None) -> None:
     """Best-effort write of org metadata."""
     row: dict = {"id": org_id}
-    if click_token:
-        row["click_token"] = click_token
+    if click_token is not None:
+        cleaned = (click_token or "").strip()
+        row["click_token"] = cleaned if cleaned else None
     try:
         sb.table("organizations").upsert(row).execute()
     except Exception as e:
