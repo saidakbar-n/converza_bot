@@ -126,8 +126,15 @@ def enrich_passport(passport: dict | None) -> dict | None:
     enriched = dict(passport)
     meta, clean_notes = _extract_meta_from_raw_notes(enriched.get("raw_notes") or "")
     enriched["raw_notes"] = clean_notes
-    for key, value in meta.items():
-        enriched.setdefault(key, value)
+
+    if "_passport" in meta and isinstance(meta["_passport"], dict):
+        for key, value in meta["_passport"].items():
+            if key != "raw_notes":
+                enriched[key] = value
+    else:
+        for key, value in meta.items():
+            enriched.setdefault(key, value)
+
     enriched["brand_voice"] = enriched.get("brand_voice") or enriched.get("tone") or ""
     enriched.setdefault("hex_colors", [])
     enriched.setdefault("competitors", [])
@@ -164,23 +171,41 @@ def upsert_passport(org_id: str, data: dict) -> dict:
     """Upsert brand_passports by org_id and sync organization metadata."""
     sync_organization(org_id, click_token=data.get("click_token"))
 
-    passport = {k: data[k] for k in DB_PASSPORT_FIELDS if k in data}
-    passport["org_id"] = org_id
-    passport["updated_at"] = datetime.now(timezone.utc).isoformat()
+    full = {k: data[k] for k in DB_PASSPORT_FIELDS if k in data}
+    user_notes = data.get("raw_notes") or ""
+    now = datetime.now(timezone.utc).isoformat()
+
+    raw_notes = _embed_meta_in_raw_notes(user_notes, {"_passport": full})
+    passport: dict = {
+        "brand_name": full.get("brand_name") or "Unnamed",
+        "org_id": org_id,
+        "updated_at": now,
+        "raw_notes": raw_notes,
+    }
+    for field in DB_PASSPORT_FIELDS:
+        if field in ("brand_name", "raw_notes"):
+            continue
+        if field in full:
+            passport[field] = full[field]
 
     existing = fetch_passport_by_org(org_id)
-    user_notes = data.get("raw_notes") or ""
-    stashed: dict = {}
 
-    for _ in range(len(DB_PASSPORT_FIELDS) + 1):
+    for _ in range(len(DB_PASSPORT_FIELDS) + 2):
         try:
             result = _persist_passport(passport, existing)
             return enrich_passport(result.data[0])
         except Exception as exc:
-            missing = parse_missing_column(str(exc))
+            missing = parse_missing_column(exc)
             if missing and missing in passport:
-                stashed[missing] = passport.pop(missing)
-                passport["raw_notes"] = _embed_meta_in_raw_notes(user_notes, stashed)
+                passport.pop(missing)
+                continue
+            if set(passport.keys()) - {"brand_name", "org_id", "updated_at", "raw_notes"}:
+                passport = {
+                    "brand_name": passport.get("brand_name") or "Unnamed",
+                    "org_id": org_id,
+                    "updated_at": now,
+                    "raw_notes": raw_notes,
+                }
                 continue
             raise ValueError(format_supabase_error(exc)) from exc
 
