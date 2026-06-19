@@ -5,14 +5,19 @@ Unified Brand Passport service — single write/read path for all Converza agent
 (click_token, business_connection_id) linked by org_id.
 """
 
+import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from db.supabase_client import sb
+from services.supabase_errors import format_supabase_error, parse_missing_column
 
 logger = logging.getLogger(__name__)
 
-# Columns that exist on the live Supabase brand_passports table.
+_META_START = "---converza_meta---"
+_META_END = "---end_meta---"
+
 DB_PASSPORT_FIELDS = (
     "brand_name",
     "industry",
@@ -25,6 +30,39 @@ DB_PASSPORT_FIELDS = (
     "objections",
     "raw_notes",
 )
+
+
+def _embed_meta_in_raw_notes(user_notes: str, meta: dict) -> str:
+    clean = re.sub(
+        rf"{re.escape(_META_START)}.*?{re.escape(_META_END)}\s*",
+        "",
+        user_notes or "",
+        flags=re.DOTALL,
+    ).strip()
+    block = f"{_META_START}\n{json.dumps(meta, ensure_ascii=False)}\n{_META_END}\n"
+    return block + clean
+
+
+def _extract_meta_from_raw_notes(raw_notes: str) -> tuple[dict, str]:
+    text = raw_notes or ""
+    match = re.search(
+        rf"{re.escape(_META_START)}\s*(\{{.*?\}})\s*{re.escape(_META_END)}",
+        text,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return {}, text
+    try:
+        meta = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        meta = {}
+    clean = re.sub(
+        rf"{re.escape(_META_START)}.*?{re.escape(_META_END)}\s*",
+        "",
+        text,
+        flags=re.DOTALL,
+    ).strip()
+    return meta, clean
 
 
 def normalize_brand_context(
@@ -86,7 +124,11 @@ def enrich_passport(passport: dict | None) -> dict | None:
     if not passport:
         return passport
     enriched = dict(passport)
-    enriched["brand_voice"] = passport.get("brand_voice") or passport.get("tone") or ""
+    meta, clean_notes = _extract_meta_from_raw_notes(enriched.get("raw_notes") or "")
+    enriched["raw_notes"] = clean_notes
+    for key, value in meta.items():
+        enriched.setdefault(key, value)
+    enriched["brand_voice"] = enriched.get("brand_voice") or enriched.get("tone") or ""
     enriched.setdefault("hex_colors", [])
     enriched.setdefault("competitors", [])
     enriched.setdefault("avoid_topics", [])
@@ -107,6 +149,17 @@ def fetch_passport_by_id(brand_id: str) -> dict | None:
     return enrich_passport(row)
 
 
+def _persist_passport(passport: dict, existing: dict | None):
+    if existing:
+        return (
+            sb.table("brand_passports")
+            .update(passport)
+            .eq("id", existing["id"])
+            .execute()
+        )
+    return sb.table("brand_passports").insert(passport).execute()
+
+
 def upsert_passport(org_id: str, data: dict) -> dict:
     """Upsert brand_passports by org_id and sync organization metadata."""
     sync_organization(org_id, click_token=data.get("click_token"))
@@ -116,26 +169,28 @@ def upsert_passport(org_id: str, data: dict) -> dict:
     passport["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     existing = fetch_passport_by_org(org_id)
-    if existing:
-        result = (
-            sb.table("brand_passports")
-            .update(passport)
-            .eq("id", existing["id"])
-            .execute()
-        )
-    else:
-        result = sb.table("brand_passports").insert(passport).execute()
+    user_notes = data.get("raw_notes") or ""
+    stashed: dict = {}
 
-    return enrich_passport(result.data[0])
+    for _ in range(len(DB_PASSPORT_FIELDS) + 1):
+        try:
+            result = _persist_passport(passport, existing)
+            return enrich_passport(result.data[0])
+        except Exception as exc:
+            missing = parse_missing_column(str(exc))
+            if missing and missing in passport:
+                stashed[missing] = passport.pop(missing)
+                passport["raw_notes"] = _embed_meta_in_raw_notes(user_notes, stashed)
+                continue
+            raise ValueError(format_supabase_error(exc)) from exc
+
+    raise ValueError(
+        "Brend pasportini saqlab bo'lmadi. Ma'lumotlar bazasi sxemasini tekshiring."
+    )
 
 
 def sync_organization(org_id: str, click_token: str | None = None) -> None:
-    """Best-effort write of org metadata.
-
-    `organizations` holds optional metadata (click_token, business_connection_id).
-    Login and onboarding must never fail if this write fails (e.g. the table has
-    not been provisioned yet), so errors are swallowed and logged.
-    """
+    """Best-effort write of org metadata."""
     row: dict = {"id": org_id}
     if click_token:
         row["click_token"] = click_token
