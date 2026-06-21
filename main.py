@@ -10,57 +10,59 @@ from fastapi import FastAPI
 from agents.auditor import run_nightly_audit
 from routers import webhooks, web_api
 from services.config import admin_telegram_ids, is_production, require_env_vars
+from services.telegram_bots import (
+    APP_BOT_TOKEN,
+    SALES_BOT_TOKEN,
+    app_api_base,
+    sales_api_base,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+APP_COMMANDS = [
+    {"command": "start", "description": "Converza onboarding"},
+    {"command": "help", "description": "Yordam"},
+    {"command": "status", "description": "Obuna va sozlama holati"},
+    {"command": "profile", "description": "Brend pasporti"},
+    {"command": "subscribe", "description": "Oylik obuna to'lovi"},
+    {"command": "report", "description": "Kunlik hisobot"},
+    {"command": "fill", "description": "Pasportni to'ldirish"},
+]
 
-async def set_bot_commands() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    if not token:
+APP_ADMIN_COMMANDS = APP_COMMANDS + [
+    {"command": "admin", "description": "Admin panel"},
+    {"command": "pending", "description": "Kutilayotgan arizalar"},
+    {"command": "approve", "description": "Arizani tasdiqlash"},
+    {"command": "reject", "description": "Arizani rad etish"},
+]
+
+
+async def _set_commands(api_base: str, commands: list, admin_commands: list | None = None) -> None:
+    if not api_base:
         return
-
-    commands = [
-        {"command": "start", "description": "Converza botni boshlash"},
-        {"command": "help", "description": "Nimalar qila olishim"},
-        {"command": "status", "description": "Bot holatini tekshirish"},
-        {"command": "profile", "description": "Brend pasportini ko'rish"},
-        {"command": "fill", "description": "Brend pasportini to'ldirish"},
-    ]
-    if not is_production():
-        commands.append(
-            {"command": "test_invoice", "description": "Test Click invoice yuborish"}
-        )
-
-    admin_commands = commands + [
-        {"command": "admin", "description": "Admin panel"},
-        {"command": "pending", "description": "Kutilayotgan kirish so'rovlari"},
-        {"command": "approve", "description": "So'rovni tasdiqlash"},
-        {"command": "reject", "description": "So'rovni rad etish"},
-    ]
-
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/setMyCommands",
-                json={"commands": commands},
-            )
-            for admin_id in admin_telegram_ids():
-                try:
-                    await client.post(
-                        f"https://api.telegram.org/bot{token}/setMyCommands",
-                        json={
-                            "commands": admin_commands,
-                            "scope": {
-                                "type": "chat",
-                                "chat_id": int(admin_id),
+            await client.post(f"{api_base}/setMyCommands", json={"commands": commands})
+            if admin_commands:
+                for admin_id in admin_telegram_ids():
+                    try:
+                        await client.post(
+                            f"{api_base}/setMyCommands",
+                            json={
+                                "commands": admin_commands,
+                                "scope": {"type": "chat", "chat_id": int(admin_id)},
                             },
-                        },
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to set admin commands for %s: %s", admin_id, exc)
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed admin commands for %s: %s", admin_id, exc)
     except Exception as exc:
-        logger.warning("Failed to set bot commands: %s", exc)
+        logger.warning("Failed to set bot commands on %s: %s", api_base, exc)
+
+
+async def set_bot_commands() -> None:
+    await _set_commands(app_api_base(), APP_COMMANDS, APP_ADMIN_COMMANDS)
+    # Sales bot has no public DM commands — Business DMs only.
 
 
 def _validate_startup() -> None:
@@ -68,8 +70,9 @@ def _validate_startup() -> None:
         [
             "SUPABASE_URL",
             "SUPABASE_SERVICE_KEY",
-            "GROQ_API_KEY",
+            "HERMES_API_KEY",
             "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_APP_BOT_TOKEN",
             "WEB_APP_URL",
         ],
         service="bot",
@@ -89,7 +92,7 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 
-app = FastAPI(title="Converza Telegram Bot", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Converza Telegram Bot", version="0.2.0", lifespan=lifespan)
 
 app.include_router(webhooks.router)
 app.include_router(web_api.router)
@@ -105,8 +108,13 @@ async def ready():
     checks: dict[str, str] = {}
     ok = True
 
-    for key in ("SUPABASE_URL", "GROQ_API_KEY", "TELEGRAM_BOT_TOKEN"):
-        if os.getenv(key, "").strip():
+    for key, val in (
+        ("SUPABASE_URL", os.getenv("SUPABASE_URL", "")),
+        ("HERMES_API_KEY", os.getenv("HERMES_API_KEY", "")),
+        ("TELEGRAM_BOT_TOKEN", SALES_BOT_TOKEN),
+        ("TELEGRAM_APP_BOT_TOKEN", APP_BOT_TOKEN),
+    ):
+        if val.strip():
             checks[key] = "ok"
         else:
             checks[key] = "missing"

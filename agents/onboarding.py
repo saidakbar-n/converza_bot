@@ -1,8 +1,6 @@
 import os
-import uuid
 import logging
 import httpx
-from db.supabase_client import sb
 from models.schemas import TelegramUpdate
 from agents.parser import (
     process_document,
@@ -11,21 +9,20 @@ from agents.parser import (
 )
 from services.brand_passport import upsert_passport, fetch_passport_by_org
 from services.org_resolver import owner_org_id
-from agents.closer import select_invoice_item, send_invoice
-from agents.searcher import get_organization
-from services.payments import (
-    get_payment_provider_token,
-    is_configured_provider_token,
-    payment_setup_message,
+from services.subscriptions import (
+    is_subscription_active,
+    send_subscription_invoice,
+    subscription_payments_configured,
+    subscription_status_text,
 )
 from services.brand_passport import get_org_context
 from agents.admin_access import handle_admin_command, is_admin_command
 from services.access_requests import is_user_approved
 from services.config import is_admin_telegram_id, is_production
-from services.telegram_send import send_message
+from services.telegram_bots import APP_BOT_TOKEN, SALES_BOT_USERNAME, app_api_base
+from services.telegram_send import send_app_message as send_message
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TELEGRAM_API = app_api_base()
 logger = logging.getLogger(__name__)
 
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
@@ -71,17 +68,18 @@ _FREEFORM_MIN_LEN = 40
 
 def _welcome_text(chat_id: int | None = None) -> str:
     lines = [
-        "Assalomu alaykum! Men Converza botiman.",
+        "Assalomu alaykum! Men Converza onboarding botiman (@ConverzaApp_bot).",
         "",
-        "Savollaringizga javob beraman, suhbatni davom ettiraman va kerak bo'lsa Click invoice yuboraman.",
+        "Bu yerda ro'yxatdan o'tasiz, brend pasportingizni sozlaysiz va oylik obunani to'laysiz.",
+        f"Mijozlar bilan sotuv: @{SALES_BOT_USERNAME} (Telegram Business orqali).",
         "",
-        "/profile - biznes profilingiz va brend pasporti",
-        "/help - nimalar qila olishim",
-        "/status - bot va Business ulanish holati",
-        "/fill - brend pasportini to'ldirish",
+        "/profile - brend pasporti",
+        "/subscribe - Converza oylik obuna",
+        "/report - kunlik statistik hisobot",
+        "/status - holat (obuna, pasport, Business)",
+        "/fill - pasportni savol-javob bilan to'ldirish",
+        "/help - yordam",
     ]
-    if not is_production():
-        lines.append("/test_invoice - test to'lovni tekshirish")
     if chat_id and is_admin_telegram_id(chat_id):
         lines += ["", "🛠 Admin: /admin — kirish so'rovlarini boshqarish"]
     return "\n".join(lines)
@@ -154,7 +152,7 @@ async def _download_telegram_file(file_id: str) -> bytes:
         resp.raise_for_status()
         file_path = resp.json()["result"]["file_path"]
 
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        file_url = f"https://api.telegram.org/file/bot{APP_BOT_TOKEN}/{file_path}"
         file_resp = await client.get(file_url)
         file_resp.raise_for_status()
         return file_resp.content
@@ -252,6 +250,8 @@ async def _handle_document(chat_id: int, document) -> None:
         chat_id,
         f"✅ Zo'r! {brand_name} uchun brend pasport saqlandi.\n"
         "Yana PDF yuborsangiz, ma'lumotlar ustiga qo'shaman.\n\n"
+        "Keyingi qadam: /subscribe — obunani faollashtiring.\n"
+        f"So'ng @{SALES_BOT_USERNAME} ni Business ga ulang.\n\n"
         "Profilingiz quyida 👇",
     )
     await _send_profile_or_prompt(chat_id)
@@ -418,9 +418,39 @@ async def handle_onboarding_message(update: TelegramUpdate) -> None:
     if text.startswith("/help"):
         await send_message(
             chat_id,
-            "Men Converza haqida qisqa javob beraman, mijoz holatini kuzataman va xaridga tayyor mijozga test invoice yubora olaman.\n\n"
-            "Oddiy savol yozib ko'ring yoki /test_invoice bilan to'lov oqimini tekshiring."
+            "Men Converza onboarding botiman.\n\n"
+            "Veb-sahifada ariza yuboring, tasdiqlang, pasportni to'ldiring, "
+            "obunani to'lang va Sales botni Business ga ulang.\n\n"
+            f"Veb: {_web_app_url()}\n"
+            f"Sotuv boti: @{SALES_BOT_USERNAME}",
         )
+        return
+
+    if text.startswith("/report"):
+        org_id = owner_org_id(chat_id)
+        if not is_admin_telegram_id(sender_id) and not is_user_approved(sender_id, sender_username):
+            await send_message(chat_id, "Kirish uchun admin tasdig'i kerak.")
+            return
+        await send_message(chat_id, "Hisobot tayyorlanmoqda... ⏳")
+        try:
+            from agents.auditor import send_daily_report
+
+            await send_daily_report(org_id, use_hermes=True)
+        except Exception:
+            logger.exception("Manual /report failed for %s", org_id)
+            await send_message(
+                chat_id,
+                "Hisobotni yuborishda xatolik. Keyinroq qayta urinib ko'ring.",
+            )
+        return
+
+    if text.startswith("/subscribe"):
+        org_id = owner_org_id(chat_id)
+        if is_subscription_active(org_id):
+            await send_message(chat_id, subscription_status_text(org_id))
+            return
+        ok, detail = await send_subscription_invoice(chat_id, org_id)
+        await send_message(chat_id, detail)
         return
 
     if text.startswith("/status"):
@@ -429,42 +459,29 @@ async def handle_onboarding_message(update: TelegramUpdate) -> None:
         passport = fetch_passport_by_org(org_id)
         has_passport = bool(passport and passport.get("brand_name"))
         conn_id = ctx.get("business_connection_id")
+        sub_line = subscription_status_text(org_id)
         lines = [
             "📊 Converza holati",
             "",
-            f"✅ Bot ishlayapti",
+            f"{'✅' if is_subscription_active(org_id) else '❌'} {sub_line}",
             f"{'✅' if has_passport else '❌'} Brend pasporti: "
             + (passport.get("brand_name") if has_passport else "to'ldirilmagan"),
-            f"{'✅' if conn_id else '❌'} Telegram Business ulanishi: "
+            f"{'✅' if conn_id else '❌'} Sales bot Business ulanishi: "
             + ("faol" if conn_id else "ulanmagan"),
         ]
+        if not is_subscription_active(org_id):
+            lines += ["", "Obuna uchun: /subscribe"]
         if not conn_id:
             lines += [
                 "",
                 "Mijozlar xabarlarini qabul qilish uchun:",
                 "Telegram → Sozlamalar → Business → Chatbots → "
-                f"@{os.getenv('TELEGRAM_BOT_USERNAME', 'ConverzaSales_bot')} ni qo'shing.",
+                f"@{SALES_BOT_USERNAME} ni qo'shing.",
             ]
+        if not subscription_payments_configured() and not is_production():
+            lines.append("\n(Diqqat: CONVERZA_SUBSCRIPTION_PROVIDER_TOKEN sozlanmagan.)")
         lines.append(f"\nVeb: {_web_app_url()}")
         await send_message(chat_id, "\n".join(lines))
-        return
-
-    if text.startswith("/test_invoice"):
-        if is_production():
-            await send_message(chat_id, "Test invoice ishlab chiqarishda o'chirilgan.")
-            return
-        org = await get_organization(owner_org_id(chat_id))
-        provider_token = get_payment_provider_token(org)
-        if not is_configured_provider_token(provider_token):
-            await send_message(chat_id, payment_setup_message())
-            return
-
-        invoice_item = select_invoice_item(org.get("brand_context", {}))
-        resp = await send_invoice(chat_id, provider_token, f"test_{chat_id}", invoice_item)
-        if resp.is_success:
-            await send_message(chat_id, "Test invoice yuborildi.")
-        else:
-            await send_message(chat_id, f"Invoice yuborilmadi: {resp.text[:300]}")
         return
 
     # Default fallback
@@ -485,43 +502,5 @@ async def handle_onboarding_message(update: TelegramUpdate) -> None:
             f"Veb-sahifa: {_web_app_url()}",
         )
     else:
-        cmds = "/profile, /help, /status"
-        if not is_production():
-            cmds += ", /test_invoice"
-        await send_message(chat_id, f"Savolingizni yozing yoki buyruqlardan birini tanlang: {cmds}.")
-
-async def handle_business_connection(update: TelegramUpdate) -> None:
-    conn = update.business_connection
-    if not conn:
-        return
-
-    # conn['user']['id'] is the business owner
-    org_id = str(conn["user"]["id"])
-    connection_id = conn["id"]
-    is_enabled = conn.get("is_enabled", False)
-    owner_chat_id = conn.get("user", {}).get("id")
-
-    from services.brand_passport import sync_organization
-
-    sync_organization(org_id)
-    try:
-        sb.table("organizations").upsert({
-            "id": org_id,
-            "business_connection_id": connection_id if is_enabled else None,
-        }).execute()
-    except Exception as e:
-        logger.warning("business_connection upsert skipped for %s: %s", org_id, e)
-
-    if owner_chat_id:
-        if is_enabled:
-            await send_message(
-                int(owner_chat_id),
-                "✅ Telegram Business ulanishi faollashtirildi!\n\n"
-                "Endi mijozlar biznes hisobingizga yozganda DM Closer avtomatik javob beradi.",
-            )
-        else:
-            await send_message(
-                int(owner_chat_id),
-                "⚠️ Telegram Business ulanishi o'chirildi.\n\n"
-                "Mijozlar xabarlarini qayta qabul qilish uchun botni Business → Chatbots orqali qayta ulang.",
-            )
+        cmds = "/profile, /subscribe, /report, /status, /fill, /help"
+        await send_message(chat_id, f"Buyruqlar: {cmds}")

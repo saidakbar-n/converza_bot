@@ -8,5 +8,4 @@ PyMuPDF
 python-multipart
 apscheduler
 redis
-pytest
-
+converza_bot/requirements.txt

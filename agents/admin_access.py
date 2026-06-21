@@ -24,11 +24,12 @@ from services.access_requests import (
     reject_request,
 )
 from services.config import is_admin_telegram_id
-from services.telegram_send import send_message
+from services.telegram_bots import app_api_base
+from services.telegram_send import send_app_message as send_message
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_API = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}"
+TELEGRAM_API = app_api_base()
 
 _ADMIN_COMMANDS = (
     "/admin",

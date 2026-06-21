@@ -13,6 +13,7 @@ def test_ready_when_passport_and_connection_present():
         "pricing": [{"tier": "Pro", "price": "99000"}],
     }
     with (
+        patch("services.closer_readiness.is_subscription_active", return_value=True),
         patch("services.closer_readiness.get_org_context", return_value=org),
         patch("services.closer_readiness.fetch_passport_by_org", return_value=passport),
     ):
@@ -21,8 +22,16 @@ def test_ready_when_passport_and_connection_present():
     assert reason == ""
 
 
+def test_not_ready_without_subscription():
+    with patch("services.closer_readiness.is_subscription_active", return_value=False):
+        ready, reason = assess_closer_readiness("111")
+    assert ready is False
+    assert reason == "no_active_subscription"
+
+
 def test_not_ready_without_business_connection():
     with (
+        patch("services.closer_readiness.is_subscription_active", return_value=True),
         patch("services.closer_readiness.get_org_context", return_value={}),
         patch("services.closer_readiness.fetch_passport_by_org", return_value=None),
     ):
@@ -35,6 +44,7 @@ def test_not_ready_without_pricing():
     org = {"business_connection_id": "conn-1"}
     passport = {"brand_name": "Nafis", "core_offer": "Offer", "pricing": []}
     with (
+        patch("services.closer_readiness.is_subscription_active", return_value=True),
         patch("services.closer_readiness.get_org_context", return_value=org),
         patch("services.closer_readiness.fetch_passport_by_org", return_value=passport),
     ):

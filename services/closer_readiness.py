@@ -1,9 +1,11 @@
 """Gate DM Closer until org setup is complete."""
 
 from services.brand_passport import fetch_passport_by_org, get_org_context
+from services.subscriptions import is_subscription_active
 
 REASON_LABELS = {
     "no_business_connection": "Telegram Business ulanishi yo'q",
+    "no_active_subscription": "Converza obunasi faol emas",
     "no_brand_passport": "Brend pasporti saqlanmagan",
     "missing_brand_name": "Brend nomi to'ldirilmagan",
     "missing_core_offer": "Asosiy taklif to'ldirilmagan",
@@ -15,9 +17,12 @@ def assess_closer_readiness(org_id: str) -> tuple[bool, str]:
     """
     Return (ready, reason_code).
 
-    DM Closer requires an active business connection and a minimal brand passport
+    DM Closer requires subscription, business connection, and brand passport
     before replying to customer DMs autonomously.
     """
+    if not is_subscription_active(org_id):
+        return False, "no_active_subscription"
+
     org = get_org_context(org_id)
     if not org.get("business_connection_id"):
         return False, "no_business_connection"

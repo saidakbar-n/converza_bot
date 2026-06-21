@@ -1,79 +1,67 @@
-import os
+"""Nightly / on-demand daily reports via @ConverzaApp_bot."""
+
+import logging
+
 import httpx
+
+from converza_agent.config import hermes_configured
 from db.supabase_client import sb
+from services.access_requests import is_user_approved
+from services.brand_passport import fetch_passport_by_org
+from services.config import is_admin_telegram_id
+from services.daily_report import build_daily_report
+from services.subscriptions import is_subscription_active
+from services.telegram_bots import app_api_base
+from services.telegram_send import send_app_message
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.3-70b-versatile"
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+logger = logging.getLogger(__name__)
 
-async def run_nightly_audit():
-    """Runs a nightly audit for all organizations and sends a Telegram report."""
-    # 1. Fetch all active organizations
-    orgs_resp = sb.table("organizations").select("*").execute()
-    organizations = orgs_resp.data or []
 
-    for org in organizations:
-        org_id = org.get("id")
-        
-        # 2. Fetch today's metrics
-        # For a production system, use proper timestamp filtering for "today"
-        # Since this MVP lacks precise timezone logic on DB, we'll fetch recent messages
-        # Here we just fetch the last 100 messages and group by prospect
-        msgs_resp = sb.table("messages").select("*").eq("org_id", org_id).order("created_at", desc=True).limit(100).execute()
-        messages = msgs_resp.data or []
+def _eligible_org_ids() -> list[str]:
+    """Orgs that should receive scheduled reports."""
+    rows = sb.table("organizations").select("id").execute().data or []
+    eligible: list[str] = []
+    for row in rows:
+        org_id = str(row.get("id") or "").strip()
+        if not org_id.isdigit():
+            continue
+        passport = fetch_passport_by_org(org_id)
+        if not passport or not passport.get("brand_name"):
+            continue
+        tid = int(org_id)
+        if not is_user_approved(tid) and not is_admin_telegram_id(tid):
+            continue
+        if not is_subscription_active(org_id):
+            continue
+        eligible.append(org_id)
+    return eligible
 
-        prospects_resp = sb.table("prospects").select("*").eq("org_id", org_id).execute()
-        prospects = prospects_resp.data or []
 
-        # Count conditions
-        conditions = {"cold": 0, "warm": 0, "purchasing": 0, "closed": 0}
-        for p in prospects:
-            cond = p.get("client_condition", "cold")
-            if cond in conditions:
-                conditions[cond] += 1
+async def send_daily_report(org_id: str, *, use_hermes: bool = True) -> str:
+    """Generate and send report to owner via App bot. Returns report text."""
+    text = await build_daily_report(org_id, use_hermes=use_hermes and hermes_configured())
+    api = app_api_base()
+    if api:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(
+                f"{api}/sendMessage",
+                json={"chat_id": int(org_id), "text": text},
+            )
+    else:
+        await send_app_message(int(org_id), text)
+    return text
 
-        total_messages_today = len(messages)
-        
-        # 3. Generate summary via Groq
-        system_prompt = (
-            "Siz biznes egasiga kunlik hisobot (audit) tayyorlab beruvchi AI yordamchisisiz. "
-            "Sizga bugungi statistika beriladi, siz uni qisqa, tushunarli va professional O'zbek tilida "
-            "hisobot shaklida yozib berishingiz kerak. Hisobot faqat matnli bo'lsin."
-        )
-        
-        stats_text = (
-            f"Bugun yuborilgan va qabul qilingan xabarlar (taxminiy): {total_messages_today}\n"
-            f"Mijozlar holati:\n"
-            f"- Sovuq (Cold): {conditions['cold']}\n"
-            f"- Iliq (Warm): {conditions['warm']}\n"
-            f" - Xarid jarayonida (Purchasing): {conditions['purchasing']}\n"
-            f"- Yopilgan (Closed): {conditions['closed']}"
-        )
 
+async def run_nightly_audit() -> None:
+    """Cron job — daily report to each active subscribed org (23:59 Asia/Tashkent)."""
+    org_ids = _eligible_org_ids()
+    if not org_ids:
+        logger.info("Nightly audit: no eligible orgs")
+        return
+
+    logger.info("Nightly audit: sending to %d org(s)", len(org_ids))
+    for org_id in org_ids:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    json={
-                        "model": GROQ_MODEL, 
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": stats_text}
-                        ], 
-                        "max_tokens": 500
-                    },
-                )
-                resp.raise_for_status()
-
-            report = resp.json()["choices"][0]["message"]["content"].strip()
-            
-            # Send to business owner (org_id is their Telegram chat_id)
-            async with httpx.AsyncClient(timeout=10) as tg_client:
-                await tg_client.post(
-                    f"{TELEGRAM_API}/sendMessage",
-                    json={"chat_id": org_id, "text": f"📊 KUNLIK HISOBOT\n\n{report}"},
-                )
-        except Exception as e:
-            print(f"Failed to run audit for {org_id}: {e}")
+            await send_daily_report(org_id, use_hermes=True)
+        except Exception as exc:
+            logger.exception("Daily report failed for org %s: %s", org_id, exc)
